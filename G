@@ -1,0 +1,1674 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+ INTELSEC — OSINT Investigation Platform          (single-file Flask app)
+================================================================================
+
+ INSTALL
+     pip install flask requests gunicorn
+
+ RUN
+     python app.py
+
+ PRODUCTION
+     gunicorn -w 4 -k gthread --threads 8 -b 0.0.0.0:8080 app:app
+
+ FIRST BOOT — two staff accounts are seeded automatically
+     Owner      JAY5155    key INTL-JAY5-1550-OWNR-0001
+     Co-Owner   viper996   key INTL-VIPE-R996-COOW-0002
+ Everyone else signs up from /login by choosing a username + generating a key.
+
+ ACCESS TIERS
+     member / guest / analyst  ->  own profile, own tickets, own cases,
+                                   PUBLIC MEMBER ROSTER (username + role only)
+     admin / co-owner / owner  ->  full staff console: every member's last IP,
+                                   login history, email, notes, all tickets,
+                                   all cases, complete audit log, role control
+
+ ENV VARS (all optional — sane defaults)
+     SECRET_KEY SITE_NAME SITE_TAGLINE PUBLIC_BASE_URL COOKIE_SECURE TRUST_PROXY
+     HOST PORT DEBUG DATA_DIR UPSTREAM_TIMEOUT
+     OWNER_USERNAME OWNER_KEY COOWNER_USERNAME COOWNER_KEY
+     AI_BASE_URL AI_API_KEY AI_MODEL          (optional LLM upgrade)
+     INDICIA_API_KEY INDICIA_BASE
+     EMAILOSINT_API_KEY EMAILOSINT_BASE
+     NUMLOOKUP_API_KEY NUMLOOKUP_BASE
+================================================================================
+"""
+
+import io
+import json
+import os
+import random
+import re
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from functools import wraps
+
+import requests
+from flask import (Flask, jsonify, redirect, render_template_string, request,
+                   session, url_for)
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+# ==============================================================================
+# 1. CONFIG
+# ==============================================================================
+SITE_NAME        = os.environ.get("SITE_NAME", "INTELSEC")
+SITE_TAGLINE     = os.environ.get("SITE_TAGLINE", "OSINT Investigation Platform")
+SITE_VERSION     = "3.1.0"
+PUBLIC_BASE_URL  = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+SECRET_KEY       = os.environ.get("SECRET_KEY") or uuid.uuid4().hex
+COOKIE_SECURE    = os.environ.get("COOKIE_SECURE", "0") == "1"
+TRUST_PROXY      = os.environ.get("TRUST_PROXY", "1") == "1"
+UPSTREAM_TIMEOUT = int(os.environ.get("UPSTREAM_TIMEOUT", "120"))
+HOST             = os.environ.get("HOST", "0.0.0.0")
+PORT             = int(os.environ.get("PORT", "8080"))
+DEBUG            = os.environ.get("DEBUG", "1") == "1"
+DATA_DIR         = os.environ.get("DATA_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+INDICIA_API_KEY    = os.environ.get("INDICIA_API_KEY",
+    "in_TNSigacOaNaHYLiIHnmgwwgsYYwQXRkdpbnPMUaxTzlzAtPuhQAnlykpyktnpYty")
+INDICIA_BASE       = os.environ.get("INDICIA_BASE", "https://api.indicia.app").rstrip("/")
+EMAILOSINT_API_KEY = os.environ.get("EMAILOSINT_API_KEY",
+    "eo_1GxS6ux6TzxW2lDNB50EYJqa1qBE05wZ50TwiY5TXSI-AB")
+EMAILOSINT_BASE    = os.environ.get("EMAILOSINT_BASE", "https://api.emailosint.org").rstrip("/")
+NUMLOOKUP_API_KEY  = os.environ.get("NUMLOOKUP_API_KEY",
+    "num_live_e4d4S7kc4T1S30OoRjfmCr0we9AoiGAAjgbkHeU0")
+NUMLOOKUP_BASE     = os.environ.get("NUMLOOKUP_BASE", "https://api.numlookupapi.com").rstrip("/")
+
+AI_BASE_URL = os.environ.get("AI_BASE_URL", "").rstrip("/")
+AI_API_KEY  = os.environ.get("AI_API_KEY", "")
+AI_MODEL    = os.environ.get("AI_MODEL", "gpt-4o-mini")
+
+OWNER_USERNAME   = os.environ.get("OWNER_USERNAME", "JAY5155")
+OWNER_KEY        = os.environ.get("OWNER_KEY", "INTL-JAY5-1550-OWNR-0001")
+COOWNER_USERNAME = os.environ.get("COOWNER_USERNAME", "viper996")
+COOWNER_KEY      = os.environ.get("COOWNER_KEY", "INTL-VIPE-R996-COOW-0002")
+
+# ==============================================================================
+# 2. CONSTANTS
+# ==============================================================================
+ROLES = {
+    "owner":    {"rank": 100, "label": "Owner",    "color": "#fbbf24"},
+    "co-owner": {"rank": 90,  "label": "Co-Owner", "color": "#a78bfa"},
+    "admin":    {"rank": 80,  "label": "Admin",    "color": "#38bdf8"},
+    "analyst":  {"rank": 50,  "label": "Analyst",  "color": "#34d399"},
+    "member":   {"rank": 20,  "label": "Member",   "color": "#94a3b8"},
+    "guest":    {"rank": 10,  "label": "Guest",    "color": "#64748b"},
+}
+STAFF_RANK = 80
+
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{3,20}$")
+KEY_RE      = re.compile(r"^INTL(-[A-Z0-9]{4}){4}$")
+KEY_CHARS   = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+TICKET_STATUS   = ["open", "pending", "answered", "resolved", "closed"]
+TICKET_PRIORITY = ["low", "normal", "high", "urgent"]
+TICKET_CATEGORY = ["general", "account", "api", "modules", "billing", "bug", "feature"]
+CASE_STATUS     = ["open", "active", "pending", "closed", "archived"]
+CASE_PRIORITY   = ["low", "normal", "high", "critical"]
+CASE_CLASS      = ["unclassified", "internal", "confidential", "restricted"]
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def rank(role):
+    return ROLES.get(role or "member", ROLES["member"])["rank"]
+
+
+def is_staff(role):
+    return rank(role) >= STAFF_RANK
+
+
+def role_meta(role):
+    return ROLES.get(role or "member", ROLES["member"])
+
+
+# ==============================================================================
+# 3. PERSISTENCE
+# ==============================================================================
+_LOCK = threading.RLock()
+
+
+def _p(name):
+    return os.path.join(DATA_DIR, name + ".json")
+
+
+def _r(name, default):
+    try:
+        with open(_p(name), "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return default
+
+
+def _w(name, data):
+    tmp = _p(name) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+    os.replace(tmp, _p(name))
+
+
+def next_id(prefix):
+    with _LOCK:
+        seq = _r("_seq", {})
+        seq[prefix] = int(seq.get(prefix, 0)) + 1
+        _w("_seq", seq)
+        return "%s-%04d" % (prefix, seq[prefix])
+
+
+def make_key():
+    seg = lambda n: "".join(random.choice(KEY_CHARS) for _ in range(n))
+    return "-".join(["INTL", seg(4), seg(4), seg(4), seg(4)])
+
+
+# ==============================================================================
+# 4. AUDIT LOG
+# ==============================================================================
+def log(actor, action, detail="", target="", kind="info"):
+    with _LOCK:
+        entries = _r("audit", [])
+        entries.append({
+            "id": next_id("LOG"),
+            "ts": now(),
+            "actor_id": (actor or {}).get("id", "SYSTEM"),
+            "actor": (actor or {}).get("username", "system"),
+            "actor_role": (actor or {}).get("role", "system"),
+            "action": action,
+            "target": target,
+            "detail": detail if isinstance(detail, str) else json.dumps(detail, default=str),
+            "kind": kind,
+            "ip": request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
+                  if request else "",
+        })
+        if len(entries) > 10000:
+            entries = entries[-10000:]
+        _w("audit", entries)
+
+
+def audit_read(limit=300, actor=None, kind=None, q=None):
+    entries = list(reversed(_r("audit", [])))
+    if actor:
+        entries = [e for e in entries if e.get("actor") == actor]
+    if kind:
+        entries = [e for e in entries if e.get("kind") == kind]
+    if q:
+        ql = q.lower()
+        entries = [e for e in entries
+                   if ql in (e.get("action", "") + e.get("detail", "") + e.get("actor", "")).lower()]
+    return entries[:limit]
+
+
+# ==============================================================================
+# 5. MEMBERS
+# ==============================================================================
+def members_all():
+    return list(_r("members", {}).values())
+
+
+def member_get(mid):
+    return _r("members", {}).get(mid)
+
+
+def member_by_username(username):
+    if not username:
+        return None
+    low = username.strip().lower()
+    for m in members_all():
+        if m["username"].lower() == low:
+            return m
+    return None
+
+
+def member_by_key(key):
+    if not key:
+        return None
+    k = key.strip().upper()
+    for m in members_all():
+        if m.get("key", "").upper() == k:
+            return m
+    return None
+
+
+def member_create(username, role="member", key=None, title="", email=""):
+    username = (username or "").strip()
+    if not USERNAME_RE.match(username):
+        raise ValueError("Username must be 3-20 chars: letters, numbers, . _ -")
+    if member_by_username(username):
+        raise ValueError("Username '%s' is already taken" % username)
+    with _LOCK:
+        members = _r("members", {})
+        mid = next_id("MBR")
+        m = {
+            "id": mid, "username": username, "display": username, "role": role,
+            "title": title, "email": email, "key": (key or make_key()).upper(),
+            "status": "active", "created_at": now(), "last_login": None,
+            "login_count": 0, "logins": [], "last_ip": "", "notes": "",
+        }
+        members[mid] = m
+        _w("members", members)
+        return m
+
+
+def member_update(mid, **fields):
+    with _LOCK:
+        members = _r("members", {})
+        m = members.get(mid)
+        if not m:
+            return None
+        for k, v in fields.items():
+            if v is not None:
+                m[k] = v
+        _w("members", members)
+        return m
+
+
+def member_touch_login(m):
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
+    with _LOCK:
+        members = _r("members", {})
+        mm = members.get(m["id"])
+        if not mm:
+            return
+        mm["last_login"] = now()
+        mm["login_count"] = int(mm.get("login_count", 0)) + 1
+        mm["last_ip"] = ip
+        mm.setdefault("logins", []).append({
+            "ts": now(), "ip": ip,
+            "ua": (request.headers.get("User-Agent", "") or "")[:150],
+        })
+        mm["logins"] = mm["logins"][-60:]
+        _w("members", members)
+
+
+# ---- the two shapes a member can be serialised into ------------------------
+def member_roster(m):
+    """Public roster entry — what a regular member sees. Username + role only."""
+    return {
+        "id": m["id"],
+        "username": m["username"],
+        "role": m.get("role", "member"),
+        "role_label": role_meta(m.get("role"))["label"],
+        "role_color": role_meta(m.get("role"))["color"],
+        "rank": rank(m.get("role")),
+    }
+
+
+def member_full(m, include_key=False):
+    """Staff view — everything, including last IP and login history."""
+    d = {
+        "id": m["id"], "username": m["username"], "display": m.get("display") or m["username"],
+        "role": m.get("role", "member"), "role_label": role_meta(m.get("role"))["label"],
+        "role_color": role_meta(m.get("role"))["color"], "rank": rank(m.get("role")),
+        "title": m.get("title", ""), "status": m.get("status", "active"),
+        "email": m.get("email", ""), "notes": m.get("notes", ""),
+        "created_at": m.get("created_at"), "last_login": m.get("last_login"),
+        "login_count": m.get("login_count", 0), "last_ip": m.get("last_ip", ""),
+        "logins": list(reversed(m.get("logins", [])))[:30],
+    }
+    if include_key:
+        d["key"] = m.get("key", "")
+    return d
+
+
+def seed_staff():
+    if _r("members", {}):
+        return
+    try:
+        o = member_create(OWNER_USERNAME, "owner", key=OWNER_KEY, title="Founder & Owner")
+        log(None, "member.seed", "Owner seeded: %s" % o["username"], o["id"], "system")
+    except Exception as e:
+        print("[seed] owner:", e)
+    try:
+        c = member_create(COOWNER_USERNAME, "co-owner", key=COOWNER_KEY, title="Co-Owner")
+        log(None, "member.seed", "Co-owner seeded: %s" % c["username"], c["id"], "system")
+    except Exception as e:
+        print("[seed] co-owner:", e)
+
+
+# ==============================================================================
+# 6. AI DESK
+# ==============================================================================
+KB = [
+    (["key", "access key", "signin", "sign in", "log in", "login", "cant log", "invalid key", "locked out"],
+     "Access & Keys",
+     "Your access key is your credential — it is the only thing that authenticates you. "
+     "Re-enter it exactly as issued (format INTL-XXXX-XXXX-XXXX-XXXX, case-insensitive). "
+     "If you are fully locked out, staff can rotate your key from the Members console."),
+    (["not working", "no data", "empty", "nothing", "blank", "returns nothing"],
+     "Empty Results",
+     "An empty result is often a valid answer. Try: (1) loosen the input — drop the middle name or state; "
+     "(2) re-run the same seed through Unified Search so several sources fire at once; "
+     "(3) check the HTTP badge on the result card — a 200 with empty data means the source has no record, "
+     "while a 4xx/5xx means an upstream fault."),
+    (["slow", "timeout", "timed out", "taking long", "hang", "stuck", "forever"],
+     "Slow Queries",
+     "Some modules genuinely fan out across dozens of databases. Web Databases, Username Sweep and "
+     "Image Geolocation routinely take 30-90 seconds. The header pill switches to WORKING while a job "
+     "is in flight. Upstream timeout is 120s and can be raised via the UPSTREAM_TIMEOUT env var."),
+    (["rate limit", "ratelimit", "too many", "quota", "429"],
+     "Rate Limits",
+     "You have hit an upstream provider limit. Wait 60 seconds and retry — most limits are per-minute. "
+     "If it persists across several modules the shared platform key may be throttled and staff should know."),
+    (["what is osint", "how do i use", "how to use", "getting started", "beginner", "tutorial"],
+     "Getting Started",
+     "Start with one strong seed — email first, then phone, then full name plus state. Run it, then pivot: "
+     "every new handle, phone or address becomes the next seed. Document as you go in the Multi-Board and "
+     "mark your confidence honestly."),
+    (["role", "permission", "staff", "admin", "owner", "co-owner", "promote", "ranks"],
+     "Roles & Visibility",
+     "The ladder is Owner > Co-Owner > Admin > Analyst > Member > Guest. Regular members see the member "
+     "roster as username + role only. Admin and above additionally see every member's last IP, login "
+     "history, email and notes, every support ticket, every case and the full audit log."),
+    (["billing", "credit", "price", "cost", "payment", "invoice", "refund", "plan"],
+     "Billing",
+     "Queries are billed upstream against the platform API key. Refunds and plan changes need a human — "
+     "this ticket is queued for staff review."),
+    (["bug", "broken", "error", "crash", "exception", "glitch", "wrong"],
+     "Bug Report",
+     "To speed up the fix, reply with the module name, the exact input used, the HTTP status badge from "
+     "the result card, and a screenshot if you have one. Flagged for a human."),
+    (["case", "cases", "workspace", "assignment", "assign"],
+     "Cases",
+     "Cases are the durable container for an investigation. Create one, attach the subject identifiers, "
+     "and log actions to its timeline. Cases carry a status, priority, classification and assignee."),
+    (["privacy", "private", "stored", "gdpr", "data"],
+     "Privacy",
+     "All upstream traffic is proxied server-side so API keys never reach the browser. Member records, "
+     "tickets, cases and the audit log live in the platform data directory. Boards auto-save locally and "
+     "can be pushed to the server on demand."),
+    (["api", "endpoint", "integrate", "curl", "token", "webhook"],
+     "API",
+     "Every module is reachable at POST /api/run/<slug> with a JSON body matching its form fields. "
+     "GET /api/modules returns the full registry with field definitions."),
+    (["human", "real person", "someone", "escalate", "manager", "staff"],
+     "Escalation",
+     "You are speaking to the automated first-line desk. Reply on this ticket and it is queued for a human "
+     "— staff see every ticket in their console."),
+]
+
+AI_FALLBACK = (
+    "Thanks for the detail — the ticket is logged. I could not match it cleanly to a known issue so I "
+    "have flagged it for a human reviewer. If this relates to a specific module, reply with the module "
+    "name and the exact input you used and I will narrow it down.")
+
+
+def _kb_score(text, keys):
+    t = text.lower()
+    return sum(t.count(k) for k in keys)
+
+
+def ai_compose_reply(ticket, member):
+    blob = " ".join([ticket.get("subject", ""), ticket.get("category", "")] +
+                    [m.get("body", "") for m in ticket.get("messages", []) if m.get("author") == "member"])
+    best, score = None, 0
+    for keys, title, answer in KB:
+        s = _kb_score(blob, keys)
+        if s > score:
+            best, score = (title, answer), s
+    urgent = ticket.get("priority") in ("high", "urgent")
+    if best and score >= 1:
+        topic, answer = best
+        needs_human = score < 2 or urgent
+    else:
+        topic, answer, needs_human = "General", AI_FALLBACK, True
+
+    staff = [m["username"] for m in members_all() if is_staff(m.get("role"))]
+    mine = [t for t in tickets_all() if t.get("member_id") == member["id"]]
+    open_mine = [t for t in mine if t.get("status") not in ("resolved", "closed")]
+
+    lines = [
+        "Hi %s," % member["username"], "",
+        "This is the %s automated first-line desk. Topic matched: %s." % (SITE_NAME, topic), "",
+        answer, "", "---",
+        "Role: %s  |  Your open tickets: %d  |  Priority: %s"
+        % (role_meta(member.get("role"))["label"], len(open_mine), ticket.get("priority", "normal")),
+    ]
+    if needs_human:
+        lines += ["", "Status: QUEUED FOR HUMAN REVIEW. Staff (%s) have been notified."
+                  % ", ".join(staff[:4])]
+    else:
+        lines += ["", "If this did not solve it, reply here and a human will pick it up."]
+    lines += ["", "— %s Assistant" % SITE_NAME]
+    return "\n".join(lines), topic, needs_human
+
+
+def ai_llm(messages):
+    if not AI_BASE_URL or not AI_API_KEY:
+        return None
+    try:
+        r = requests.post(AI_BASE_URL + "/chat/completions",
+                          headers={"Authorization": "Bearer " + AI_API_KEY,
+                                   "Content-Type": "application/json"},
+                          json={"model": AI_MODEL, "messages": messages,
+                                "temperature": 0.4, "max_tokens": 700}, timeout=45)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return None
+
+
+def ai_system_prompt(member):
+    return ("You are the %s support assistant. Concise, technical, friendly. Never invent URLs. "
+            "The user is %s with role %s. If human action is needed, say so."
+            % (SITE_NAME, member["username"], role_meta(member.get("role"))["label"]))
+
+
+# ==============================================================================
+# 7. TICKETS
+# ==============================================================================
+def tickets_all():
+    return list(_r("tickets", {}).values())
+
+
+def ticket_get(tid):
+    return _r("tickets", {}).get(tid)
+
+
+def ticket_save(t):
+    with _LOCK:
+        tickets = _r("tickets", {})
+        tickets[t["id"]] = t
+        _w("tickets", tickets)
+
+
+def ticket_create(member, subject, body, category="general", priority="normal"):
+    tid = next_id("TKT")
+    t = {
+        "id": tid, "member_id": member["id"], "username": member["username"],
+        "role": member.get("role"), "subject": subject.strip()[:160] or "(no subject)",
+        "category": category if category in TICKET_CATEGORY else "general",
+        "priority": priority if priority in TICKET_PRIORITY else "normal",
+        "status": "open", "needs_human": False, "assigned_to": None, "ai_topics": [],
+        "created_at": now(), "updated_at": now(),
+        "messages": [{"id": next_id("MSG"), "author": "member", "name": member["username"],
+                      "role": member.get("role"), "body": body.strip()[:6000], "ts": now()}],
+    }
+    ticket_save(t)
+    ticket_ai_reply(tid)
+    return t
+
+
+def ticket_add_message(tid, author, name, role, body, meta=None):
+    t = ticket_get(tid)
+    if not t:
+        return None
+    t["messages"].append({"id": next_id("MSG"), "author": author, "name": name, "role": role,
+                          "body": body, "ts": now(), "meta": meta or {}})
+    t["updated_at"] = now()
+    if author == "staff":
+        t["status"] = "answered"
+        t["needs_human"] = False
+    elif author == "member" and t["status"] in ("resolved", "closed"):
+        t["status"] = "open"
+    ticket_save(t)
+    return t
+
+
+def ticket_ai_reply(tid):
+    t = ticket_get(tid)
+    if not t:
+        return None
+    member = member_get(t["member_id"]) or {"id": t["member_id"], "username": t["username"],
+                                            "role": t.get("role")}
+    body, topic, needs_human = ai_compose_reply(t, member)
+    upgrade = ai_llm([{"role": "system", "content": ai_system_prompt(member)}] +
+                     [{"role": "assistant" if m["author"] == "ai" else "user", "content": m["body"]}
+                      for m in t["messages"][-6:]])
+    if upgrade:
+        body = upgrade
+    t["messages"].append({"id": next_id("MSG"), "author": "ai",
+                          "name": SITE_NAME + " Assistant", "role": "ai", "body": body, "ts": now(),
+                          "meta": {"topic": topic, "needs_human": needs_human, "llm": bool(upgrade)}})
+    t["ai_topics"] = sorted(set(t.get("ai_topics", []) + [topic]))
+    t["needs_human"] = needs_human
+    t["status"] = "pending" if needs_human else "answered"
+    t["updated_at"] = now()
+    ticket_save(t)
+    return t
+
+
+def ticket_staff_has_replied(t):
+    return any(m.get("author") == "staff" for m in t.get("messages", []))
+
+
+# ==============================================================================
+# 8. CASES
+# ==============================================================================
+def cases_all():
+    return list(_r("cases", {}).values())
+
+
+def case_get(cid):
+    return _r("cases", {}).get(cid)
+
+
+def case_save(c):
+    with _LOCK:
+        cases = _r("cases", {})
+        cases[c["id"]] = c
+        _w("cases", cases)
+
+
+def case_create(member, title, subject_name="", priority="normal", classification="unclassified"):
+    cid = next_id("CASE")
+    c = {
+        "id": cid, "title": title.strip()[:160] or "Untitled case",
+        "subject_name": subject_name.strip()[:120], "status": "open",
+        "priority": priority if priority in CASE_PRIORITY else "normal",
+        "classification": classification if classification in CASE_CLASS else "unclassified",
+        "assigned_to": None, "created_by": member["id"], "created_by_name": member["username"],
+        "created_at": now(), "updated_at": now(), "identifiers": {}, "summary": "", "findings": [],
+        "timeline": [{"ts": now(), "actor": member["username"], "action": "case.created",
+                      "detail": "Case opened"}],
+    }
+    case_save(c)
+    return c
+
+
+def case_touch(cid, actor, action, detail=""):
+    c = case_get(cid)
+    if not c:
+        return None
+    c["timeline"].append({"ts": now(), "actor": actor.get("username", "system"),
+                          "action": action, "detail": detail})
+    c["updated_at"] = now()
+    case_save(c)
+    return c
+
+
+# ==============================================================================
+# 9. BOARDS
+# ==============================================================================
+def board_get(mid):
+    return _r("boards", {}).get(mid, {})
+
+
+def board_save(mid, data):
+    with _LOCK:
+        boards = _r("boards", {})
+        boards[mid] = data
+        _w("boards", boards)
+
+
+# ==============================================================================
+# 10. MODULE REGISTRY
+# ==============================================================================
+def _f(key, label, ph="", type="text", options=None):
+    d = {"key": key, "label": label, "ph": ph, "type": type}
+    if options:
+        d["options"] = options
+    return d
+
+
+def _m(slug, label, group, fields, path, provider="indicia", method="json",
+       mapping=None, pick=None, combine=None, consts=None, kind="json",
+       transform=None, note=None, phone_field=None):
+    return slug, {
+        "slug": slug, "label": label, "group": group, "fields": fields, "note": note,
+        "api": {"provider": provider, "path": path, "method": method, "kind": kind,
+                "map": mapping or {}, "pick": pick or {}, "combine": combine or {},
+                "consts": consts or {}, "transform": transform, "phone_field": phone_field},
+    }
+
+
+MODULES = dict([
+    _m("person-search", "Person Search", "US SEARCH",
+       [_f("first", "FIRST NAME", "John"), _f("last", "LAST NAME", "Doe"),
+        _f("city", "CITY (optional)", "Los Angeles"), _f("state", "STATE (optional)", "CA")],
+       "/v1/search/intelligence/person", combine={"name": ["first", "last"]},
+       mapping={"city": "city", "state": "state"},
+       consts={"enhanced": True, "allowMissingFirstName": True}),
+
+    _m("address-search", "Address Search", "US SEARCH",
+       [_f("addr", "STREET ADDRESS", "1600 Pennsylvania Ave"), _f("city", "CITY", "Washington"),
+        _f("state", "STATE", "DC"), _f("zip", "ZIP CODE", "20500")],
+       "/v1/search/intelligence/address",
+       mapping={"addr": "address1", "city": "city", "state": "state", "zip": "zip"},
+       consts={"enhanced": True, "address2": ""}),
+
+    _m("phone-lookup", "Phone Lookup", "US SEARCH", [_f("phone", "PHONE NUMBER", "+1 415 555 2231")],
+       "/v1/search/intelligence/phone", mapping={"phone": "query"}, consts={"enhanced": True}),
+
+    _m("email-lookup", "Email Lookup", "US SEARCH", [_f("email", "EMAIL ADDRESS", "target@gmail.com")],
+       "/v1/search/intelligence/email", mapping={"email": "query"}, consts={"enhanced": True}),
+
+    _m("relatives", "Relatives", "US SEARCH",
+       [_f("first", "FIRST NAME", "John"), _f("last", "LAST NAME", "Doe")],
+       "/v1/search/intelligence/person", combine={"name": ["first", "last"]},
+       consts={"enhanced": True, "allowMissingFirstName": True}),
+
+    _m("associates", "Associates", "US SEARCH",
+       [_f("first", "FIRST NAME", "John"), _f("last", "LAST NAME", "Doe")],
+       "/v1/search/intelligence/person", combine={"name": ["first", "last"]},
+       consts={"enhanced": True, "allowMissingFirstName": True}),
+
+    _m("aliases", "Aliases", "US SEARCH", [_f("name", "FULL NAME", "John A. Doe")],
+       "/v1/search/intelligence/person", mapping={"name": "name"}, consts={"enhanced": True}),
+
+    _m("live-intelligence", "Live Intelligence", "SOCIAL",
+       [_f("keyword", "MONITOR KEYWORD", "target name / org / term")],
+       "/v1/search/socials/telegram", mapping={"keyword": "query"},
+       consts={"limit": 50, "sortOrder": "desc"}),
+
+    _m("telegram", "Telegram", "SOCIAL",
+       [_f("user", "USERNAME / HANDLE", "@target_user"), _f("query", "KEYWORD", "target term")],
+       "/v1/search/socials/telegram", mapping={"user": "username", "query": "query"},
+       consts={"limit": 50, "sortOrder": "desc"}),
+
+    _m("discord", "Discord", "SOCIAL", [_f("user", "USERNAME / USER ID", "target_user")],
+       "/v1/search/socials/discord", mapping={"user": "query"}, consts={"fields": []}),
+
+    _m("github", "GitHub", "SOCIAL", [_f("user", "USERNAME / HANDLE", "octocat")],
+       "/v1/search/socials/github", mapping={"user": "query"}),
+
+    _m("linkedin", "LinkedIn", "SOCIAL",
+       [_f("user", "DISPLAY NAME", "Jane Doe"), _f("email", "EMAIL", "jane@company.com")],
+       "/v1/search/socials/linkedin", mapping={"user": "displayName", "email": "email"}),
+
+    _m("roblox", "Roblox", "SOCIAL",
+       [_f("user", "USERNAME", "target_user"), _f("id", "USER ID", "12345678")],
+       "/v1/search/socials/roblox", pick={"query": ["user", "id"]},
+       consts={"type": "uname", "fields": []}),
+
+    _m("reddit", "Reddit", "SOCIAL", [_f("user", "USERNAME", "spez")],
+       "/v1/search/socials/reddit", mapping={"user": "author"},
+       consts={"type": "comments", "limit": 50}),
+
+    _m("tiktok", "TikTok", "SOCIAL", [_f("user", "USERNAME", "@target_user")],
+       "/v1/search/socials/tiktok", mapping={"user": "query"}, consts={"type": "username"}),
+
+    _m("instagram", "Instagram", "SOCIAL",
+       [_f("user", "USERNAME", "@target_user"), _f("cookie", "SESSION COOKIE (optional)", "sessionid=...")],
+       "/v1/search/socials/instagram", mapping={"user": "query", "cookie": "cookie"}),
+
+    _m("epic-games", "Epic Games", "SOCIAL", [_f("user", "USERNAME / DISPLAY NAME", "TargetUser")],
+       "/v1/search/socials/epic", mapping={"user": "query"}),
+
+    _m("playstation", "PlayStation", "SOCIAL", [_f("user", "PSN ONLINE ID", "target_user")],
+       "/v1/search/socials/playstation", mapping={"user": "query"}),
+
+    _m("steam", "Steam", "SOCIAL", [_f("steamid", "STEAM ID / VANITY URL", "76561198... or /id/target")],
+       "/v1/search/socials/steam", mapping={"steamid": "query"}),
+
+    _m("forums-search", "Forums Search", "SOCIAL",
+       [_f("user", "USERNAME / AUTHOR", "target_user"), _f("query", "KEYWORD", "term"),
+        _f("forum", "FORUM (optional)", "nulled.to")],
+       "/v1/search/intelligence/horus-forums",
+       mapping={"user": "author", "query": "query", "forum": "forum"},
+       consts={"limit": 50, "ignoreCasing": True}),
+
+    _m("link-resolver", "Link Resolver", "SOCIAL", [_f("link", "LINK TO RESOLVE", "https://bit.ly/...")],
+       "/v1/tools/link-resolver", mapping={"link": "url"}),
+
+    _m("username-search", "Username Sweep (1000+ sites)", "SOCIAL",
+       [_f("user", "USERNAME", "target_user")], "/v2/search/socials/username", kind="sse",
+       mapping={"user": "query"}, consts={"allowNotify": True},
+       note="Streams one event per service. Large sweeps take 30-90s."),
+
+    _m("web-databases", "Web Databases (multi-source)", "INTEL",
+       [_f("query", "DATABASE QUERY", "name, email, phone, keyword...")],
+       "/v1/search/intelligence/web-dbs", mapping={"query": "query"},
+       consts={"services": [], "cloudsintType": "any", "horusType": "domain",
+               "intelxType": "email", "leakCheckType": "auto", "snusbaseType": "_domain"}),
+
+    _m("breach-search", "Breach Search", "INTEL",
+       [_f("email", "EMAIL ADDRESS", "target@gmail.com"), _f("user", "USERNAME", "target_user")],
+       "/v1/search/intelligence/web-dbs", pick={"query": ["email", "user"]},
+       consts={"services": [], "cloudsintType": "any", "horusType": "domain",
+               "intelxType": "email", "leakCheckType": "auto", "snusbaseType": "_domain"}),
+
+    _m("leaked-documents", "Leaked Documents", "INTEL",
+       [_f("keyword", "DOCUMENT KEYWORD", "filename, content, org...")],
+       "/v1/search/intelligence/horus-stealer", mapping={"keyword": "query"},
+       consts={"field": "all", "limit": 50, "page": 1}),
+
+    _m("reverse-face-search", "Reverse Face Search", "INTEL",
+       [_f("image", "IMAGE URL", "https://.../photo.jpg", type="image")],
+       "/v1/search/intelligence/facial", kind="file"),
+
+    _m("image-geolocation", "Image Geolocation", "INTEL",
+       [_f("image", "IMAGE URL", "https://.../photo.jpg", type="image"),
+        _f("hint", "LOCATION HINT (optional)", "Tokyo")],
+       "/v1/search/intelligence/geolocation", kind="file",
+       mapping={"hint": "locationHint"}, consts={"model": "default"}),
+
+    _m("wifi-geolocation", "WiFi / BSSID Geolocation", "INTEL",
+       [_f("bssid", "BSSID / MAC", "AA:BB:CC:DD:EE:FF")],
+       "/v1/search/intelligence/location-to-bssid", mapping={"bssid": "query"}),
+
+    _m("wifi-network-map", "WiFi Network Map", "INTEL",
+       [_f("area", "AREA / SSID / BSSID", "Shibuya, Tokyo or SSID name")],
+       "/v1/search/intelligence/wifi-network-map", mapping={"area": "query"}),
+
+    _m("cell-tower-lookup", "Cell Tower Lookup", "INTEL",
+       [_f("cellid", "MCC-MNC-CELLID-TAC", "310-410-12345-67890")],
+       "/v1/search/infrastructure/celltower", transform="celltower"),
+
+    _m("gmail-lookup", "Gmail / Google Account", "INTEL",
+       [_f("email", "GMAIL ADDRESS", "target@gmail.com")],
+       "/v1/search/intelligence/gmail", mapping={"email": "email"}),
+
+    _m("hudson-rock", "Hudson Rock", "INTEL",
+       [_f("email", "EMAIL ADDRESS", "target@company.com"), _f("domain", "DOMAIN", "company.com")],
+       "/v1/search/intelligence/hudsonrock", pick={"query": ["domain", "email"]},
+       consts={"type": "domain"}),
+
+    _m("horus-logs", "Horus Stealer Logs", "INTEL",
+       [_f("email", "EMAIL", "target@gmail.com"), _f("gid", "MACHINE / PC KEY", "A9F2-...")],
+       "/v1/search/intelligence/horus-stealer", pick={"query": ["email", "gid"]},
+       consts={"field": "all", "limit": 50, "page": 1}),
+
+    _m("horus-machine", "Horus Stealer Machine", "INTEL",
+       [_f("gid", "MACHINE / PC KEY", "A9F2-...")],
+       "/v1/search/intelligence/horus-stealer-pc", mapping={"gid": "pcKey"}),
+
+    _m("horus-socials", "Horus Recovered Socials", "INTEL",
+       [_f("gid", "PC KEY", "A9F2-..."), _f("email", "EMAIL", "target@gmail.com"),
+        _f("platform", "PLATFORM (optional)", "discord")],
+       "/v1/search/intelligence/horus-stealer-socials", pick={"q": ["gid", "email"]},
+       mapping={"platform": "platform"}, consts={"limit": 50}),
+
+    _m("horus-cards", "Horus Card Records", "INTEL",
+       [_f("brand", "CARD BRAND (optional)", "amex"), _f("bin", "BIN (optional)", "411111")],
+       "/v1/search/intelligence/horus-cards", mapping={"brand": "brand", "bin": "bin"},
+       consts={"limit": 50, "offset": 0}),
+
+    _m("ransomware-groups", "Ransomware Groups", "INTEL",
+       [_f("group", "GROUP NAME / VICTIM (blank = all)", "")],
+       "/v1/search/intelligence/ransomware", mapping={"group": "query"}),
+
+    _m("cve-lookup", "CVE Lookup", "INTEL", [_f("cve", "CVE ID", "CVE-2026-1183")],
+       "/v1/search/intelligence/cve", mapping={"cve": "query"}),
+
+    _m("virustotal-search", "VirusTotal Content Search", "INTEL",
+       [_f("hash", "HASH / KEYWORD", "sha256 or filename"), _f("domain", "DOMAIN", "example.com"),
+        _f("ip", "IP ADDRESS", "185.220.101.7")],
+       "/v1/search/intelligence/virustotal", pick={"query": ["hash", "domain", "ip"]},
+       consts={"entity": "files"}),
+
+    _m("crypto-analyzer", "Crypto Address Analyzer", "INTEL",
+       [_f("crypto", "CRYPTO ADDRESS", "bc1q... or 0x..."),
+        _f("network", "NETWORK (optional)", "ethereum")],
+       "/v1/tools/crypto", mapping={"crypto": "address", "network": "network"}),
+
+    _m("app-store-search", "App Store Search", "INTEL",
+       [_f("app", "APP NAME / BUNDLE ID", "com.example.app"),
+        _f("store", "STORE", "apple", type="select", options=["apple", "google"])],
+       "/v1/tools/appstore", mapping={"app": "query", "store": "store"}),
+
+    _m("ip-lookup", "IP Lookup / Threat Intel", "INTEL", [_f("ip", "IP ADDRESS", "185.220.101.7")],
+       "/v1/search/infrastructure/ipinfo", mapping={"ip": "query"}),
+
+    _m("dns-lookup", "DNS Lookup", "INTEL", [_f("domain", "DOMAIN", "example.com")],
+       "/v1/search/infrastructure/dns", mapping={"domain": "query"}),
+
+    _m("port-scan", "Port / Service Scan (Shodan)", "INTEL", [_f("ip", "IP / QUERY", "185.220.101.7")],
+       "/v1/search/infrastructure/shodan", mapping={"ip": "query"}),
+
+    _m("certificate-search", "Certificate Transparency", "INTEL",
+       [_f("domain", "DOMAIN", "example.com")],
+       "/v1/search/infrastructure/certificates", mapping={"domain": "query"}),
+
+    _m("ai-service-finder", "AI Service Finder", "INTEL",
+       [_f("scope", "DOMAIN / IP / CIDR", "example.com"),
+        _f("preset", "PRESET", "chat_ui", type="select",
+           options=["chat_ui", "llm_api", "vector_db", "gpu_cloud", "embedding", "any"])],
+       "/v1/search/infrastructure/ai-infra", mapping={"scope": "scope", "preset": "preset"}),
+
+    _m("url-scan", "URL Scan (urlscan.io)", "INTEL",
+       [_f("url", "URL / DOMAIN / HASH", "https://example.com/page")],
+       "/v1/search/intelligence/urlscan", mapping={"url": "query"}),
+
+    _m("email-osint", "Email OSINT (account discovery)", "INTEL",
+       [_f("email", "EMAIL ADDRESS", "alex.morgan@example.com")],
+       "/v1/lookup/email", provider="emailosint", mapping={"email": "email"},
+       consts={"module_timeout_ms": 15000}),
+
+    _m("double-counter", "Double Counter Bypass", "TOOLS",
+       [_f("url", "SERVER INVITE URL / GUILD ID", "https://discord.gg/xxxx")],
+       "/v1/tools/doublecounter", mapping={"url": "url"}),
+
+    _m("roblox-scraper", "Roblox Profile Scraper", "TOOLS",
+       [_f("user", "USERNAME", "target_user"), _f("id", "USER ID", "12345678")],
+       "/v1/search/socials/roblox", pick={"query": ["user", "id"]},
+       consts={"type": "uname", "fields": []}),
+
+    _m("intelx-downloader", "IntelX Downloader", "TOOLS",
+       [_f("selector", "STORAGE ID", "uuid..."), _f("bucket", "BUCKET", "darknet.i2p")],
+       "/v1/tools/intelx", mapping={"selector": "storageId", "bucket": "bucket"}),
+
+    _m("virustotal-downloader", "VirusTotal Downloader", "TOOLS",
+       [_f("hash", "FILE HASH", "d41d8cd98f00b204e9800998ecf8427e")],
+       "/v1/tools/virustotal", mapping={"hash": "id"}),
+
+    _m("horus-download", "Horus File Download", "TOOLS",
+       [_f("fileid", "FILE ID", "file identifier..."), _f("gid", "PC KEY", "A9F2-...")],
+       "/v1/search/intelligence/horus-stealer-download",
+       mapping={"fileid": "file", "gid": "pcKey"}),
+
+    _m("phone-validate", "Phone Validation / Carrier", "TOOLS",
+       [_f("phone", "PHONE NUMBER", "+12069220880")],
+       "/v1/validate/{phone}", provider="numlookup", method="get", phone_field="phone"),
+])
+
+GROUPS = ["US SEARCH", "SOCIAL", "INTEL", "TOOLS"]
+
+PUBLIC_MODULES = {s: {"slug": m["slug"], "label": m["label"], "group": m["group"],
+                      "fields": m["fields"], "note": m["note"]}
+                  for s, m in MODULES.items()}
+
+# ==============================================================================
+# 11. UPSTREAM EXECUTION
+# ==============================================================================
+def _parse_sse(text):
+    events, cur, buf = [], None, []
+    for line in text.splitlines():
+        if line.startswith("event:"):
+            cur = line[6:].strip()
+        elif line.startswith("data:"):
+            buf.append(line[5:].strip())
+        elif line.strip() == "" and buf:
+            raw = "\n".join(buf)
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = raw
+            events.append({"event": cur or "message", "data": payload})
+            cur, buf = None, []
+    if buf:
+        raw = "\n".join(buf)
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = raw
+        events.append({"event": cur or "message", "data": payload})
+    return events
+
+
+def _fetch_media(url):
+    if not url:
+        raise ValueError("image url required")
+    if url.startswith("data:"):
+        import base64
+        head, b64 = url.split(",", 1)
+        ctype = head.split(";")[0].replace("data:", "") or "image/jpeg"
+        return "upload." + (ctype.split("/")[-1] or "jpg"), base64.b64decode(b64), ctype
+    r = requests.get(url, timeout=45, headers={"User-Agent": "INTELSEC/1.0"})
+    r.raise_for_status()
+    ctype = r.headers.get("content-type", "image/jpeg").split(";")[0]
+    name = url.split("?")[0].rstrip("/").rsplit("/", 1)[-1] or "upload.jpg"
+    return name, r.content, ctype
+
+
+def _build_payload(api, form):
+    payload = dict(api.get("consts") or {})
+    for src, dst in (api.get("map") or {}).items():
+        v = form.get(src)
+        if v not in (None, ""):
+            payload[dst] = v
+    for dst, srcs in (api.get("pick") or {}).items():
+        for s in srcs:
+            v = form.get(s)
+            if v not in (None, ""):
+                payload[dst] = v
+                break
+    for dst, srcs in (api.get("combine") or {}).items():
+        parts = [str(form.get(s)).strip() for s in srcs if form.get(s)]
+        if parts:
+            payload[dst] = " ".join(parts)
+    return payload
+
+
+def _transform_celltower(payload, form):
+    raw = re.sub(r"[^0-9\-]", "", str(form.get("cellid", "")))
+    parts = [p for p in raw.split("-") if p]
+    if len(parts) >= 4:
+        payload.update({"mcc": int(parts[0]), "mnc": int(parts[1]),
+                        "cellId": int(parts[2]), "tacId": int(parts[3]), "maxResults": 10})
+    elif len(parts) == 1:
+        payload["cellId"] = int(parts[0])
+    return payload
+
+
+TRANSFORMS = {"celltower": _transform_celltower}
+
+
+def _wrap(r, provider, sse=False):
+    ctype = r.headers.get("content-type", "")
+    text = r.text
+    out = {"success": r.ok, "provider": provider, "status": r.status_code}
+    if "event-stream" in ctype or (sse and text.lstrip().startswith(("event:", "data:"))):
+        events = _parse_sse(text)
+        out["events"] = events
+        out["event_count"] = len(events)
+        if events:
+            out["data"] = events[-1]["data"]
+        return out
+    try:
+        out["data"] = r.json()
+        if isinstance(out["data"], dict) and out["data"].get("success") is False:
+            out["success"] = False
+    except Exception:
+        out["raw"] = text[:200000]
+        if not r.ok:
+            out["success"] = False
+    if not r.ok:
+        out["error"] = "upstream returned HTTP %d" % r.status_code
+        if isinstance(out.get("data"), dict):
+            out["error"] = out["data"].get("error") or out["error"]
+    return out
+
+
+def execute(spec, form):
+    api = spec["api"]
+    provider, path, kind = api["provider"], api["path"], api["kind"]
+
+    if provider == "numlookup":
+        phone = re.sub(r"[^\d+]", "", str(form.get(api.get("phone_field", "phone"), "")))
+        if not phone:
+            return {"success": False, "error": "phone number required"}
+        r = requests.get(NUMLOOKUP_BASE + path.replace("{phone}", phone),
+                         headers={"apikey": NUMLOOKUP_API_KEY}, timeout=UPSTREAM_TIMEOUT)
+        return _wrap(r, "numlookup")
+
+    if provider == "emailosint":
+        payload = _build_payload(api, form)
+        r = requests.post(EMAILOSINT_BASE + path, json=payload, timeout=UPSTREAM_TIMEOUT,
+                          headers={"Authorization": "Bearer " + EMAILOSINT_API_KEY,
+                                   "Content-Type": "application/json"})
+        return _wrap(r, "emailosint")
+
+    headers = {"x-api-key": INDICIA_API_KEY}
+    url = INDICIA_BASE + path
+
+    if api["method"] == "get":
+        return _wrap(requests.get(url, headers=headers, timeout=UPSTREAM_TIMEOUT), "indicia")
+
+    if kind == "file":
+        src = form.get("image_b64") or form.get("image") or ""
+        name, content, ctype = _fetch_media(src)
+        data = _build_payload(api, form)
+        r = requests.post(url, headers=headers, files={"media": (name, io.BytesIO(content), ctype)},
+                          data=data, timeout=UPSTREAM_TIMEOUT)
+        return _wrap(r, "indicia", sse=True)
+
+    payload = _build_payload(api, form)
+    if api.get("transform"):
+        payload = TRANSFORMS[api["transform"]](payload, form)
+    if not payload:
+        return {"success": False, "error": "no input provided"}
+
+    r = requests.post(url, json=payload,
+                      headers=dict(headers, **{"Content-Type": "application/json"}),
+                      timeout=UPSTREAM_TIMEOUT)
+    return _wrap(r, "indicia", sse=(kind == "sse"))
+
+
+# ==============================================================================
+# 12. FLASK APP
+# ==============================================================================
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=COOKIE_SECURE, PREFERRED_URL_SCHEME="https",
+    MAX_CONTENT_LENGTH=32 * 1024 * 1024, JSON_SORT_KEYS=False,
+)
+if TRUST_PROXY:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
+
+
+@app.after_request
+def _headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "SAMEORIGIN"
+    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    if request.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def current_member():
+    mid = session.get("mid")
+    return member_get(mid) if mid else None
+
+
+def login_required(fn):
+    @wraps(fn)
+    def inner(*a, **kw):
+        if not current_member():
+            return jsonify({"success": False, "error": "not authenticated"}), 401
+        return fn(*a, **kw)
+    return inner
+
+
+def staff_required(fn):
+    @wraps(fn)
+    def inner(*a, **kw):
+        me = current_member()
+        if not me:
+            return jsonify({"success": False, "error": "not authenticated"}), 401
+        if not is_staff(me.get("role")):
+            return jsonify({"success": False, "error": "staff only"}), 403
+        return fn(*a, **kw)
+    return inner
+
+
+# ---------------------------------------------------------------- pages ----
+@app.route("/")
+def index():
+    return redirect(url_for("dashboard") if session.get("mid") else url_for("login_page"))
+
+
+@app.route("/login")
+def login_page():
+    return render_template_string(LOGIN_HTML, site=SITE_NAME, tagline=SITE_TAGLINE)
+
+
+@app.route("/dashboard")
+def dashboard():
+    if not session.get("mid"):
+        return redirect(url_for("login_page"))
+    return render_template_string(DASH_HTML, site=SITE_NAME, tagline=SITE_TAGLINE,
+                                  version=SITE_VERSION)
+
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"status": "ok", "version": SITE_VERSION, "time": now()})
+
+
+# ---------------------------------------------------------------- auth -----
+@app.route("/api/signup", methods=["POST"])
+def api_signup():
+    d = request.get_json(silent=True) or {}
+    username = (d.get("username") or "").strip()
+    email = (d.get("email") or "").strip()
+    if not USERNAME_RE.match(username):
+        return jsonify({"success": False, "error":
+                        "Username must be 3-20 characters (letters, numbers, . _ -)"}), 400
+    if member_by_username(username):
+        return jsonify({"success": False, "error": "Username '%s' is already taken" % username}), 409
+    try:
+        m = member_create(username, "member", email=email)
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    log(m, "member.signup", "New member registered", m["id"], "auth")
+    session["mid"] = m["id"]
+    session.permanent = True
+    member_touch_login(m)
+    log(m, "auth.login", "First login", m["id"], "auth")
+    return jsonify({"success": True, "key": m["key"], "member": member_full(m, True)})
+
+
+@app.route("/api/signin", methods=["POST"])
+def api_signin():
+    d = request.get_json(silent=True) or {}
+    key = (d.get("key") or "").strip().upper()
+    if not KEY_RE.match(key):
+        return jsonify({"success": False, "error": "Malformed key — expected INTL-XXXX-XXXX-XXXX-XXXX"}), 400
+    m = member_by_key(key)
+    if not m:
+        return jsonify({"success": False, "error": "No member is bound to that key"}), 401
+    if m.get("status") == "banned":
+        return jsonify({"success": False, "error": "Account is suspended"}), 403
+    session["mid"] = m["id"]
+    session.permanent = True
+    member_touch_login(m)
+    log(m, "auth.login", "Signed in", m["id"], "auth")
+    return jsonify({"success": True, "member": member_full(m, True)})
+
+
+@app.route("/api/signout", methods=["POST"])
+def api_signout():
+    m = current_member()
+    if m:
+        log(m, "auth.logout", "Signed out", m["id"], "auth")
+    session.clear()
+    return jsonify({"success": True})
+
+
+@app.route("/api/me")
+@login_required
+def api_me():
+    me = current_member()
+    d = member_full(me, include_key=True)
+    d["is_staff"] = is_staff(me.get("role"))
+    d["open_tickets"] = len([t for t in tickets_all()
+                             if t.get("member_id") == me["id"]
+                             and t.get("status") not in ("resolved", "closed")])
+    return jsonify({"success": True, "member": d})
+
+
+@app.route("/api/meta")
+def api_meta():
+    return jsonify({"site": SITE_NAME, "tagline": SITE_TAGLINE, "version": SITE_VERSION,
+                    "groups": GROUPS, "module_count": len(MODULES), "server_time": now(),
+                    "public_base_url": PUBLIC_BASE_URL})
+
+
+@app.route("/api/modules")
+@login_required
+def api_modules():
+    return jsonify({"success": True, "groups": GROUPS, "modules": PUBLIC_MODULES})
+
+
+# ------------------------------------------------------------- modules -----
+@app.route("/api/run/<slug>", methods=["POST"])
+@login_required
+def api_run(slug):
+    spec = MODULES.get(slug)
+    if not spec:
+        return jsonify({"success": False, "error": "unknown module: %s" % slug}), 404
+    me = current_member()
+    form = request.get_json(silent=True) or {}
+    t0 = time.time()
+    try:
+        result = execute(spec, form)
+    except requests.exceptions.Timeout:
+        return jsonify({"success": False, "module": slug, "error": "upstream timeout"})
+    except requests.exceptions.RequestException as e:
+        return jsonify({"success": False, "module": slug, "error": "network error: %s" % e})
+    except Exception as e:
+        return jsonify({"success": False, "module": slug, "error": "%s: %s" % (type(e).__name__, e)})
+    result["module"] = slug
+    result["label"] = spec["label"]
+    result["duration_ms"] = int((time.time() - t0) * 1000)
+    result["fetched_at"] = now()
+    log(me, "query.run", "%s :: %s" % (spec["label"], json.dumps(form, default=str)[:300]),
+        slug, "query")
+    return jsonify(result)
+
+
+@app.route("/api/run-batch", methods=["POST"])
+@login_required
+def api_run_batch():
+    jobs = (request.get_json(silent=True) or {}).get("jobs", [])[:24]
+    me = current_member()
+    out = []
+    for job in jobs:
+        slug = job.get("slug")
+        spec = MODULES.get(slug)
+        if not spec:
+            out.append({"slug": slug, "success": False, "error": "unknown module"})
+            continue
+        t0 = time.time()
+        try:
+            res = execute(spec, job.get("form") or {})
+        except Exception as e:
+            res = {"success": False, "error": "%s: %s" % (type(e).__name__, e)}
+        res.update({"slug": slug, "label": spec["label"],
+                    "duration_ms": int((time.time() - t0) * 1000)})
+        out.append(res)
+    log(me, "query.batch", "%d modules fired" % len(jobs), "", "query")
+    return jsonify({"success": True, "results": out})
+
+
+# -------------------------------------------------------------- board ------
+@app.route("/api/board", methods=["GET"])
+@login_required
+def api_board_get():
+    return jsonify({"success": True, "board": board_get(current_member()["id"])})
+
+
+@app.route("/api/board", methods=["POST"])
+@login_required
+def api_board_save():
+    me = current_member()
+    board_save(me["id"], request.get_json(silent=True) or {})
+    log(me, "board.save", "Board pushed to server", me["id"], "board")
+    return jsonify({"success": True, "saved_at": now()})
+
+
+# ------------------------------------------------------------- members -----
+@app.route("/api/members")
+@login_required
+def api_members():
+    """Roster for everyone. Full intel only for staff."""
+    me = current_member()
+    staff = is_staff(me.get("role"))
+    ms = sorted(members_all(), key=lambda x: (-rank(x.get("role")), x["username"].lower()))
+    if staff:
+        payload = [member_full(m, include_key=(m["id"] == me["id"])) for m in ms]
+    else:
+        payload = [member_roster(m) for m in ms]
+    return jsonify({"success": True, "staff_view": staff, "members": payload,
+                    "count": len(payload)})
+
+
+@app.route("/api/members/<mid>")
+@login_required
+def api_member(mid):
+    me = current_member()
+    m = member_get(mid)
+    if not m:
+        return jsonify({"success": False, "error": "not found"}), 404
+    if is_staff(me.get("role")) or mid == me["id"]:
+        return jsonify({"success": True, "member": member_full(m, include_key=(mid == me["id"]))})
+    return jsonify({"success": True, "member": member_roster(m)})
+
+
+@app.route("/api/members/<mid>/role", methods=["POST"])
+@staff_required
+def api_member_role(mid):
+    me = current_member()
+    m = member_get(mid)
+    if not m:
+        return jsonify({"success": False, "error": "not found"}), 404
+    new_role = (request.get_json(silent=True) or {}).get("role", "")
+    if new_role not in ROLES:
+        return jsonify({"success": False, "error": "unknown role"}), 400
+    if rank(new_role) >= rank(me.get("role")) and mid != me["id"]:
+        return jsonify({"success": False,
+                        "error": "cannot assign a role at or above your own"}), 403
+    old = m.get("role")
+    member_update(mid, role=new_role)
+    log(me, "member.role", "%s: %s -> %s" % (m["username"], old, new_role), mid, "admin")
+    return jsonify({"success": True, "member": member_full(member_get(mid), True)})
+
+
+@app.route("/api/members/<mid>/status", methods=["POST"])
+@staff_required
+def api_member_status(mid):
+    me = current_member()
+    m = member_get(mid)
+    if not m:
+        return jsonify({"success": False, "error": "not found"}), 404
+    status = (request.get_json(silent=True) or {}).get("status", "active")
+    if status not in ("active", "banned"):
+        return jsonify({"success": False, "error": "bad status"}), 400
+    member_update(mid, status=status)
+    log(me, "member.status", "%s -> %s" % (m["username"], status), mid, "admin")
+    return jsonify({"success": True})
+
+
+@app.route("/api/members/<mid>/rotate", methods=["POST"])
+@staff_required
+def api_member_rotate(mid):
+    me = current_member()
+    m = member_get(mid)
+    if not m:
+        return jsonify({"success": False, "error": "not found"}), 404
+    new_key = make_key()
+    member_update(mid, key=new_key)
+    log(me, "member.rotate", "Key rotated for %s" % m["username"], mid, "admin")
+    return jsonify({"success": True, "key": new_key})
+
+
+@app.route("/api/logins")
+@staff_required
+def api_logins():
+    """Cross-member login feed — staff only."""
+    feed = []
+    for m in members_all():
+        for l in m.get("logins", []):
+            feed.append({"username": m["username"], "member_id": m["id"],
+                         "role": m.get("role"), "ts": l.get("ts"),
+                         "ip": l.get("ip"), "ua": l.get("ua")})
+    feed.sort(key=lambda x: x.get("ts") or "", reverse=True)
+    return jsonify({"success": True, "logins": feed[:150], "total": len(feed)})
+
+
+# ------------------------------------------------------------- tickets -----
+def _ticket_view(t, staff):
+    d = {k: t.get(k) for k in ("id", "member_id", "username", "subject", "category",
+                               "priority", "status", "needs_human", "created_at", "updated_at",
+                               "ai_topics", "assigned_to")}
+    d["message_count"] = len(t.get("messages", []))
+    d["last_author"] = (t.get("messages") or [{}])[-1].get("author", "")
+    if staff:
+        d["messages"] = t.get("messages", [])
+    return d
+
+
+@app.route("/api/tickets")
+@login_required
+def api_tickets():
+    me = current_member()
+    staff = is_staff(me.get("role"))
+    ts = tickets_all()
+    if not staff:
+        ts = [t for t in ts if t.get("member_id") == me["id"]]
+    ts.sort(key=lambda t: t.get("updated_at") or "", reverse=True)
+    return jsonify({"success": True, "staff_view": staff, "tickets": [_ticket_view(t, staff) for t in ts]})
+
+
+@app.route("/api/tickets/<tid>")
+@login_required
+def api_ticket(tid):
+    me = current_member()
+    staff = is_staff(me.get("role"))
+    t = ticket_get(tid)
+    if not t:
+        return jsonify({"success": False, "error": "not found"}), 404
+    if not staff and t.get("member_id") != me["id"]:
+        return jsonify({"success": False, "error": "forbidden"}), 403
+    return jsonify({"success": True, "ticket": t, "staff_view": staff})
+
+
+@app.route("/api/tickets", methods=["POST"])
+@login_required
+def api_ticket_create():
+    me = current_member()
+    d = request.get_json(silent=True) or {}
+    if not (d.get("body") or "").strip():
+        return jsonify({"success": False, "error": "message required"}), 400
+    t = ticket_create(me, d.get("subject", ""), d.get("body", ""),
+                      d.get("category", "general"), d.get("priority", "normal"))
+    log(me, "ticket.create", t["subject"], t["id"], "support")
+    return jsonify({"success": True, "ticket": t})
+
+
+@app.route("/api/tickets/<tid>/reply", methods=["POST"])
+@login_required
+def api_ticket_reply(tid):
+    me = current_member()
+    staff = is_staff(me.get("role"))
+    t = ticket_get(tid)
+    if not t:
+        return jsonify({"success": False, "error": "not found"}), 404
+    if not staff and t.get("member_id") != me["id"]:
+        return jsonify({"success": False, "error": "forbidden"}), 403
+    body = ((request.get_json(silent=True) or {}).get("body") or "").strip()
+    if not body:
+        return jsonify({"success": False, "error": "empty reply"}), 400
+    ticket_add_message(tid, "staff" if staff else "member", me["username"], me.get("role"), body)
+    log(me, "ticket.reply", "%s on %s" % (t["subject"], tid), tid, "support")
+    if not staff and not ticket_staff_has_replied(ticket_get(tid)):
+        ticket_ai_reply(tid)
+        log(me, "ticket.ai", "AI follow-up on %s" % tid, tid, "ai")
+    return jsonify({"success": True, "ticket": ticket_get(tid)})
+
+
+@app.route("/api/tickets/<tid>/status", methods=["POST"])
+@login_required
+def api_ticket_status(tid):
+    me = current_member()
+    staff = is_staff(me.get("role"))
+    t = ticket_get(tid)
+    if not t:
+        return jsonify({"success": False, "error": "not found"}), 404
+    if not staff and t.get("member_id") != me["id"]:
+        return jsonify({"success": False, "error": "forbidden"}), 403
+    status = (request.get_json(silent=True) or {}).get("status", "open")
+    if status not in TICKET_STATUS:
+        return jsonify({"success": False, "error": "bad status"}), 400
+    t["status"] = status
+    t["updated_at"] = now()
+    if status in ("resolved", "closed"):
+        t["needs_human"] = False
+    ticket_save(t)
+    log(me, "ticket.status", "%s -> %s" % (tid, status), tid, "support")
+    return jsonify({"success": True})
+
+
+@app.route("/api/tickets/<tid>/assign", methods=["POST"])
+@staff_required
+def api_ticket_assign(tid):
+    me = current_member()
+    t = ticket_get(tid)
+    if not t:
+        return jsonify({"success": False, "error": "not found"}), 404
+    t["assigned_to"] = (request.get_json(silent=True) or {}).get("member_id") or me["id"]
+    t["updated_at"] = now()
+    ticket_save(t)
+    log(me, "ticket.assign", "%s assigned" % tid, tid, "support")
+    return jsonify({"success": True})
+
+
+# --------------------------------------------------------------- cases -----
+def _case_view(c, me, staff):
+    d = dict(c)
+    if not staff:
+        d["timeline"] = c.get("timeline", [])
+    return d
+
+
+@app.route("/api/cases")
+@login_required
+def api_cases():
+    me = current_member()
+    staff = is_staff(me.get("role"))
+    cs = cases_all()
+    if not staff:
+        cs = [c for c in cs if c.get("created_by") == me["id"] or c.get("assigned_to") == me["id"]]
+    cs.sort(key=lambda c: c.get("updated_at") or "", reverse=True)
+    return jsonify({"success": True, "staff_view": staff,
+                    "cases": [_case_view(c, me, staff) for c in cs]})
+
+
+@app.route("/api/cases", methods=["POST"])
+@login_required
+def api_case_create():
+    me = current_member()
+    d = request.get_json(silent=True) or {}
+    c = case_create(me, d.get("title", ""), d.get("subject_name", ""),
+                    d.get("priority", "normal"), d.get("classification", "unclassified"))
+    log(me, "case.create", c["title"], c["id"], "case")
+    return jsonify({"success": True, "case": c})
+
+
+@app.route("/api/cases/<cid>", methods=["POST"])
+@login_required
+def api_case_update(cid):
+    me = current_member()
+    c = case_get(cid)
+    if not c:
+        return jsonify({"success": False, "error": "not found"}), 404
+    staff = is_staff(me.get("role"))
+    if not staff and c.get("created_by") != me["id"]:
+        return jsonify({"success": False, "error": "forbidden"}), 403
+    d = request.get_json(silent=True) or {}
+    for k in ("title", "subject_name", "summary", "status", "priority",
+              "classification", "assigned_to"):
+        if k in d and d[k] is not None:
+            c[k] = d[k]
+    if "identifiers" in d:
+        c["identifiers"] = d["identifiers"]
+    if "finding" in d and d["finding"]:
+        c.setdefault("findings", []).append({"ts": now(), "by": me["username"],
+                                             "text": d["finding"]})
+    c["updated_at"] = now()
+    case_save(c)
+    log(me, "case.update", cid, cid, "case")
+    return jsonify({"success": True, "case": c})
+
+
+# --------------------------------------------------------------- audit -----
+@app.route("/api/audit")
+@login_required
+def api_audit():
+    me = current_member()
+    staff = is_staff(me.get("role"))
+    limit = min(int(request.args.get("limit", 300)), 1000)
+    if staff:
+        entries = audit_read(limit=limit, kind=request.args.get("kind") or None,
+                             actor=request.args.get("actor") or None,
+                             q=request.args.get("q") or None)
+    else:
+        entries = audit_read(limit=limit, actor=me["username"])
+    return jsonify({"success": True, "staff_view": staff, "entries": entries})
+
+
+@app.route("/api/stats")
+@login_required
+def api_stats():
+    me = current_member()
+    staff = is_staff(me.get("role"))
+    ts = tickets_all()
+    cs = cases_all()
+    return jsonify({
+        "success": True,
+        "modules": len(MODULES),
+        "members": len(members_all()),
+        "tickets": len(ts) if staff else len([t for t in ts if t.get("member_id") == me["id"]]),
+        "tickets_needs_human": len([t for t in ts if t.get("needs_human")]) if staff else 0,
+        "cases": len(cs) if staff else len([c for c in cs if c.get("created_by") == me["id"]]),
+        "audit": len(audit_read(limit=1000)) if staff else len(audit_read(limit=1000, actor=me["username"])),
+    })
+
+
+# ------------------------------------------------------------- ai chat -----
+@app.route("/api/ai/ask", methods=["POST"])
+@login_required
+def api_ai_ask():
+    me = current_member()
+    d = request.get_json(silent=True) or {}
+    prompt = (d.get("prompt") or "").strip()
+    ctx = d.get("context") or {}
+    if not prompt:
+        return jsonify({"success": False, "error": "prompt required"}), 400
+
+    upgrade = ai_llm([{"role": "system", "content": ai_system_prompt(me)},
+                      {"role": "user", "content": prompt +
+                       ("\n\nContext:\n" + json.dumps(ctx, default=str)[:2000] if ctx else "")}])
+    if upgrade:
+        log(me, "ai.chat", prompt[:120], "", "ai")
+        return jsonify({"success": True, "reply": upgrade, "engine": "llm"})
+
+    fake_ticket = {"subject": prompt, "category": "general", "priority": "normal",
+                   "messages": [{"author": "member", "body": prompt}]}
+    body, topic, needs_human = ai_compose_reply(fake_ticket, me)
+    log(me, "ai.chat", prompt[:120], "", "ai")
+    return jsonify({"success": True, "reply": body, "topic": topic,
+                    "needs_human": needs_human, "engine": "rules"})
+
+
+# ==============================================================================
+# 13. TEMPLATES
+# ==============================================================================
+LOGO_SVG = """<svg viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M50 4 L92 26 V60 C92 78 72 92 50 96 C28 92 8 78 8 60 V26 Z" stroke="#22d3ee" stroke-width="4.5" fill="rgba(34,211,238,.07)"/>
+<path d="M50 20 L78 34 V60 C78 71 65 81 50 84 C35 81 22 71 22 60 V34 Z" stroke="#38bdf8" stroke-width="2.2" fill="none" opacity=".65"/>
+<circle cx="50" cy="52" r="13" stroke="#22d3ee" stroke-width="3.5" fill="none"/>
+<circle cx="50" cy="52" r="4" fill="#22d3ee"/>
+<path d="M50 30 v8 M50 66 v8 M28 52 h8 M64 52 h8" stroke="#22d3ee" stroke-width="3" stroke-linecap="round"/>
+</svg>"""
+
+LOGIN_HTML = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ site }} — Access</title>
+<style>
+:root{--bg:#060a11;--panel:#0c1421;--line:#1b2a41;--txt:#dbe6f5;--dim:#7b8ca6;--acc:#22d3ee}
+*{box-sizing:border-box}html,body{height:100%}
+body{margin:0;background:radial-gradient(1100px 600px at 50% -10%,rgba(34,211,238,.10),transparent 60%),radial-gradient(800px 500px at 100% 100%,rgba(56,189,248,.07),transparent 60%),var(--bg);
+color:var(--txt);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;display:grid;place-items:center;padding:24px}
+.grid{position:fixed;inset:0;background-image:linear-gradient(rgba(34,211,238,.045) 1px,transparent 1px),linear-gradient(90deg,rgba(34,211,238,.045) 1px,transparent 1px);
+background-size:44px 44px;mask-image:radial-gradient(ellipse at 50% 40%,#000 30%,transparent 78%);pointer-events:none}
+.card{position:relative;width:100%;max-width:460px;background:linear-gradient(180deg,rgba(13,20,32,.97),rgba(9,14,22,.99));
+border:1px solid var(--line);border-radius:18px;padding:34px 32px 28px;box-shadow:0 30px 70px rgba(0,0,0,.65)}
+.card:before{content:"";position:absolute;inset:-1px;border-radius:18px;padding:1px;background:linear-gradient(140deg,rgba(34,211,238,.5),transparent 42%,transparent 58%,rgba(56,189,248,.38));
+-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none}
+.logo{width:66px;height:66px;margin:0 auto 14px}
+h1{text-align:center;margin:0;font-size:25px;letter-spacing:.22em;font-weight:700}
+.sub{text-align:center;color:var(--dim);font-size:11px;letter-spacing:.26em;text-transform:uppercase;margin:7px 0 22px}
+.tabs{display:flex;border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-bottom:18px}
+.tabs button{flex:1;background:none;border:none;color:var(--dim);padding:11px;cursor:pointer;font:700 11px/1 inherit;letter-spacing:.12em;text-transform:uppercase}
+.tabs button.on{background:rgba(34,211,238,.1);color:var(--acc)}
+label{display:block;font-size:10px;letter-spacing:.16em;color:var(--dim);text-transform:uppercase;margin:0 0 7px}
+input{width:100%;background:#080e18;border:1px solid var(--line);border-radius:10px;color:var(--txt);padding:12px 13px;
+font:600 14px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.08em;outline:none;transition:.15s;margin-bottom:13px}
+input:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(34,211,238,.12)}
+.row{display:flex;gap:8px}
+.row button{flex:1}
+button{cursor:pointer;border:1px solid var(--line);background:#111c2c;color:var(--txt);border-radius:10px;padding:12px 15px;
+font:700 11px/1 inherit;letter-spacing:.1em;text-transform:uppercase;transition:.15s}
+button:hover{border-color:var(--acc);color:var(--acc)}
+button.pri{background:linear-gradient(180deg,#22d3ee,#0ea5c4);color:#04121a;border-color:transparent;width:100%;margin-top:16px;font-weight:800}
+button.pri:hover{filter:brightness(1.08);color:#04121a}
+.msg{margin-top:12px;font-size:12.5px;text-align:center;min-height:18px}
+.msg.err{color:#f87171}.msg.ok{color:#34d399}
+.note{margin-top:16px;padding-top:14px;border-top:1px solid var(--line);color:var(--dim);font-size:11px;line-height:1.7;text-align:center}
+.hint{color:var(--dim);font-size:11px;margin:-8px 0 12px}
+</style></head><body>
+<div class="grid"></div>
+<div class="card">
+  <div class="logo">__LOGO__</div>
+  <h1>{{ site }}</h1>
+  <div class="sub">{{ tagline }}</div>
+
+  <div class="tabs">
+    <button id="tabIn" class="on" onclick="tab('in')">Sign In</button>
+    <button id="tabUp" onclick="tab('up')">Create Account</button>
+  </div>
+
+  <div id="paneIn">
+    <label>Access Key</label>
+    <input id="keyIn" placeholder="INTL-XXXX-XXXX-XXXX-XXXX" spellcheck="false" autocomplete="off">
+    <div class="row">
+      <button onclick="copyEl('keyIn')">Copy</button>
+      <button onclick="goIn()">Enter</button>
+    </div>
+  </div>
+
+  <div id="paneUp" style="display:none">
+    <label>Choose Username</label>
+    <input id="unameUp" placeholder="e.g. viper996" spellcheck="false" autocomplete="off">
+    <div class="hint">3-20 chars — letters, numbers, . _ -</div>
+    <label>Email (optional)</label>
+    <input id="emailUp" placeholder="you@example.com" spellcheck="false" autocomplete="off">
+    <label>Your Access Key</label>
+    <input id="keyUp" placeholder="generate below" spellcheck="false" autocomplete="off">
+    <div class="row">
+      <button onclick="gen()">Generate Key</button>
+      <button onclick="copyEl('keyUp')">Copy</button>
+    </div>
+    <button class="pri" onclick="goUp()">Create Account &amp; Enter</button>
+  </div>
+
+  <div class="msg" id="msg"></div>
+  <div class="note">Keys are the credential. Staff accounts are pre-seeded by the owner.</div>
+</div>
+<script>
+function tab(t){
+  document.getElementById('tabIn').classList.toggle('on',t==='in');
+  document.getElementById('tabUp').classList.toggle('on',t==='up');
+  document.getElementById('paneIn').style.display=t==='in'?'':'none';
+  document.getElementById('paneUp').style.display=t==='up'?'':'none';
+  document.getElementById('msg').textContent='';
+}
+function say(m,cls){var e=document.getElementById('msg');e.className='msg '+(cls||'');e.textContent=m;}
+function copyEl(id){var e=document.getElementById(id);e.select();navigator.clipboard.writeText(e.value);say('Copied','ok');}
+function gen(){
+  var c='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  function s(n){var o='';for(var i=0;i<n;i++)o+=c[Math.floor(Math.random()*c.length)];return o;}
+  document.getElementById('keyUp').value=['INTL',s(4),s(4),s(4),s(4)].join('-');
+  say('Key generated — save it somewhere safe.','ok');
+}
+async function goIn(){
+  var key=document.getElementById('keyIn').value.trim().toUpperCase();
+  if(!key){say('Enter your access key','err');return;}
+  say('Authenticating...');
+  try{
+    var r=await fetch('/api/signin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:key})});
+    var j=await r.json();
+    if(j.success){say('Access granted','ok');setTimeout(function(){location.href='/dashboard';},380);}
+    else say(j.error||'Access denied','err');
+  }catch(e){say('Connection failed','err');}
+}
+async function goUp(){
+  var u=document.getElementById('unameUp').value.trim();
+  var e=document.getElementById('emailUp').value.trim();
+  var k=document.getElementById('keyUp').value.trim().toUpperCase();
+  if(!u){say('Pick a username','err');return;}
+  if(!k){gen();k=document.getElementById('keyUp').value;}
+  say('Creating account...');
+  try{
+    var r=await fetch('/api/signup',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username:u,email:e,key:k})});
+    var j=await r.json();
+    if(j.success){say('Account created','ok');setTimeout(function(){location.href='/dashboard';},420);}
+    else say(j.error||'Could not create account','err');
+  }catch(err){say('Connection failed','err');}
+}
+document.getElementById('keyIn').addEventListener('keydown',function(e){if(e.key==='Enter')goIn();});
+</script></body></html>""".replace("__LOGO__", LOGO_SVG)
